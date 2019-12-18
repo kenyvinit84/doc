@@ -1,0 +1,42 @@
+{
+  "title": "Please make your selection from below list (Optional)",
+  "type": "object",
+  "anyOf": [
+    {
+      "title": "Create and delete new test mailbox on the database",
+      "properties": {
+        "Database Name": {
+          "type": "string",
+          "title": "Database Name",
+          "default": "For e.g.: Database1"
+        },
+        "Password": {
+          "type": "string",
+          "title": "Password for the test mailbox",
+          "default": "*****",
+          "minLength": 5
+        }
+      }
+    },
+    {
+      "title": "Test internal mail flow for the given database as input",
+      "properties": {
+        "Test Mail flow": {
+          "type": "string",
+          "title": "Database Name",
+          "default": "For e.g.: Database1"
+        }
+      }
+    },
+    {
+      "title": "Execute CHKDSK on below mentioned drive in ‘Read Only’ mode",
+      "properties": {
+        "Check Disk": {
+          "type": "string",
+          "title": "Drive Letter",
+          "default": "For e.g.: C"
+        }
+      }
+    }
+  ]
+}

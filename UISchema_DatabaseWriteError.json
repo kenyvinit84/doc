@@ -1,0 +1,18 @@
+{
+  "Database Name": {
+    "ui:widget": "textarea",
+    "ui:help": "The switch will create new mailbox and delete the same at the end of script, which will confirm the database write operation is working fine and it's not locked by any application, service etc."
+  },
+  "Check Disk": {
+    "ui:widget": "textarea",
+    "ui:help": "If the CHKDSK (read only mode) process is selected to run, then it will only run CHKDSK function in ‘Read Only’ mode and not the entire script. The CHKDSK process selected script will run for maximum 25 minutes. If process execution exceeds 25 minutes then it will print the partially completed details and terminate the execution asking technician to manually run CHKDSK by login to the server."
+  },
+  "password": {
+    "ui:widget": "password",
+    "ui:help": "Test mailbox password"
+  },
+  "Test Mail flow": {
+    "ui:widget": "textarea",
+    "ui:help": "This option will only test the internal mail flow (and not the entire script) for the specified database, which will confirm the database write operation is working fine and it's not locked by any application, service etc. By default the script will perform internal mail flow however this option will provide addition option to the tech to test internal mail flow with different databases as well if he wish so."
+  }
+  }
