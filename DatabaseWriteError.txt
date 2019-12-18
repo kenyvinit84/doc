@@ -1,0 +1,1008 @@
+<#
+.SYNOPSIS
+                MS Exchange - Database write error
+                
+.DESCRIPTION
+                The script will be run by the tech to check the following details:
+                    1. Checks whether Exchange is present on the machine or not.
+                    2. Checks the exchange version
+                    3. Checks the roles installed on the exchange server
+                    4. Checks the mailbox database status
+                    5. Checks the internal mailflow test
+                    6. Checks the copy status in case of DAG
+                    7. Checks the mail queue and prints the same
+                    8. Checks for ESE event ids and corresponding DISK/NTF/VolSnap events
+                    9. Checks the read/write speed  of logical and the physical disks
+                    10. Checks the top 5 processes utilizing high read and write IOs
+                    11. Performs diskcheck on the disk input by the user
+                    12. Creates a new mailbox on the specified database
+
+.NOTES    
+                Name: DatabaseWriteError.ps1
+				Author: <Abhishek Trivedi - GRT, Continuum>
+				Version: 1.4
+                Created On : 05-11-2019
+                Updated On : 17-12-2019
+                Reference JIRA : GRT-5267
+  
+.PARAMETERS     Seven Parameter:
+                    1. $driveLetter                 : Drive letter by the user on which the dirty disk test(fsutil) will be performed. [TextBox]
+                    2. $chkdsk_Switch               : Should be true to perform chkdsk [Boolean]
+                    3. $password                    : Password for the new created database [TextBox]
+                    4. $new_mailbox_switch          : New mailbox creation switch [Boolean]
+                    5. $database_from_user          : Datbase on which the mailbox needs to be created [Textbox]
+                    6. $test_mailflow_switch        : To perform internal mailflow test on a specified database [boolean]
+                    7. $test_mailflow_db            : Database on which the test is needed to be peformed [Textbox] 
+#>
+
+
+
+<#
+$password                   =  "P@SSWoRD"
+$new_mailbox_switch         = $true
+$database_from_user         = "DB1"
+$driveLetter                ="C"
+$chkdsk_Switch              = $true
+$test_mailflow_switch       = $true
+$test_mailflow_db           = "DB1"
+#>
+
+
+if($Case -eq "new_mailbox_switch")
+{
+    $new_mailbox_switch = $true
+    $test_mailflow_switch = $false
+    $chkdsk_Switch = $false
+    $driveLetter = $null
+    $test_mailflow_db = $null
+}
+elseif($Case -eq "test_mailflow_switch")
+{
+    $test_mailflow_switch = $true
+    $new_mailbox_switch = $false
+    $chkdsk_Switch = $false
+    $driveLetter = $null
+    $database_from_user = $null
+    $password = $null
+}
+elseif($Case -eq "chkdsk_Switch")
+{
+    $chkdsk_Switch = $true
+    $new_mailbox_switch = $false
+    $test_mailflow_switch = $false
+    $database_from_user = $null
+    $password = $null
+    $test_mailflow_db = $null
+}
+else
+{
+    $driveLetter = $null
+    $database_from_user = $null
+    $password = $null
+    $test_mailflow_db = $null
+    $new_mailbox_switch = $false
+    $test_mailflow_switch = $false
+    $chkdsk_Switch = $false
+}
+
+<# Architecture check started and PS changed to the OS compatible #>
+if ($env:PROCESSOR_ARCHITEW6432 -eq "AMD64") {
+	Write-Warning "Excecuting the script under 64 bit powershell"
+	if ($myInvocation.Line) {
+		& "$env:systemroot\sysnative\windowspowershell\v1.0\powershell.exe" -NonInteractive -NoProfile $myInvocation.Line
+	} else {
+		& "$env:systemroot\sysnative\windowspowershell\v1.0\powershell.exe" -NonInteractive -NoProfile -File "$($myInvocation.InvocationName)" $args
+	}
+	exit $lastexitcode
+}
+<#Architecture check completed #>
+
+<# Compatibility check if found incompatible will exit #>
+try {
+	[double]$OSVersion = [Environment]::OSVersion.Version.ToString(2)
+	$PSVersion = (Get-Host).Version
+	if (($OSVersion -lt 6.1) -or ($PSVersion.Major -lt 2))
+	{
+		Write-Output "[MSG: System is not compatible with the requirement. Either machine is below Windows 7 / Windows 2008 R2 or PowerShell version is lower than 2.0]"
+		exit
+	}
+} catch { Write-Output "[MSG: ERROR : $_.Exception.message]" }
+<# Compatibility Check Code Ends #>
+
+
+
+
+
+<#
+-Function to check if the server is an exchange server or not
+-Checks whether MSExchangeServiceHost is present or not
+-Looks for the PSSnapin of Exchange, if not present installs the same
+#>
+function check_exchange {
+	$ErrorActionPreference = "SilentlyContinue"
+	if (!(Get-Service -Name MSExchangeServiceHost -ComputerName $env:computername)) {
+		return $true	
+	}
+
+	if (!(Get-PSSnapin *Exchange*)) {
+		Add-PSSnapin *Exchange*
+	}
+}
+
+
+
+function check_exchange_version{
+
+	$exchange_build_number =  Get-Command ExSetup | ForEach-Object {$_.FileVersionInfo} | Select-Object -ExpandProperty ProductVersion                
+	$build         =  0.0 + $exchange_build_number.SubString(0,5)
+
+    if($build -ge 6 -and $build -lt 8){
+	Return "2003"}
+    elseif($build -ge 8 -and $build -lt 14){
+	Return "2007"}
+    elseif($build -ge 14 -and $build -lt 15){
+	Return "2010"}
+    elseif($build -ge 15.0 -and $build -lt 15.01){
+	Return "2013"}
+    elseif($build -ge 15.01 -and $build -lt 15.02){
+	Return "2016"}
+	elseif($build -ge 15.02){
+    Return "2019"}
+	else{
+	Return $false}
+}
+
+
+  
+
+
+<#
+-Function to check the result of mail flow test on all the databases on the server
+-return false if the test fails for any of the database on the server
+-It will also inform the tech about the databases for which the mail flow test is failed
+#>
+function test_mailflow($version, $target){
+    
+    $ErrorActionPreference = "SilentlyContinue"
+    
+try{
+
+    if($version -eq 2007){
+        $test_mailflow = Test-Mailflow -TargetMailboxServer $target -ExecutionTimeout 120 -ErrorAction Stop
+        if($test_mailflow.testmailflowresult -notlike "*Success*"){
+            Write-Output "Internal mailflow is not working properly."
+        }
+        else{
+            Write-Output "Internal MailFlow is working fine on the server."        
+        }
+
+        if($test_mailflow){
+            Write-Output "Following is the result of Test-Mailflow command:"
+            $test_mailflow | Format-List | Out-String
+        }
+        else {
+            Write-Output "Unable to fetch the output of the mailflow test."
+        }
+    }
+    else{
+        if($version -ne 2007){
+            try{
+                $test_mailflow = Test-Mailflow -TargetDatabase (Get-MailboxDatabase | Where-Object{$_.Name -like $target}) -ExecutionTimeout 120 -ErrorAction Stop
+                if($test_mailflow.testmailflowresult -notlike "*Success*"){
+                    Write-Output "Internal mailflow is not working properly."
+                }
+                else{
+                    Write-Output "Internal MailFlow is working fine on the database."        
+                }
+        
+                if($test_mailflow){
+                    Write-Output "Following is the result of Test-Mailflow command:"
+                    $test_mailflow | Format-List | Out-String
+                }
+                else {
+                    Write-Output "Unable to fetch the output of the mailflow test."
+                }
+            }
+            catch{
+                Write-Output "[MSG: ERROR : $($_.Exception.message)]"   
+            }
+        }
+    }
+    
+}
+
+catch{
+    Write-Output "[MSG: ERROR : $($_.Exception.message)]"   
+}
+}
+
+
+<#
+-To tun FSUTIL against the all the local drives
+#>
+
+Function check_drive_path{
+ 
+    try{
+       
+       foreach($driveLetter in (Get-WmiObject win32_logicaldisk | ?{$_.DriveType -eq 3} | Select -ExpandProperty Name)){
+
+            $sysvolInfo = Get-WmiObject -Class Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $driveLetter } | Select-Object DeviceID, FileSystem, @{L = 'PercentFree'; E = { "{0:N2}" -f (($_.freespace / $_.size) * 100) } }, @{n = "FreeSpace"; e = { [math]::Round($_.FreeSpace / 1GB, 2) } }, @{L = 'Dirty Status'; E = { fsutil dirty query $_.DeviceID } }
+            if($sysvolInfo){
+                Write-Output "Below are the result of FSUTIL command over $($driveLetter) drive`n$($sysvolInfo | Format-List | Out-String)"
+            }
+            else{
+                Write-Output "Unable to fetch the device Information for $($driveLetter)"
+            }
+       }
+   
+    }
+   
+    catch{
+       Write-Output "Some error occurred while checking the $($driveLetter) drive."
+       Write-Output "[MSG: ERROR : $_.Exception.message]" 
+    }
+}
+
+
+
+
+<#
+-To get the event details of 531
+#>
+Function get_event_details_531{
+
+    try{
+        $Event531 = @()
+        $Event531 += Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 531; StartTime =  ((Get-Date).AddDays(-15)) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        if(!$Event531){
+            Write-Output "No most recent performance related ESE events found"
+            Return
+        }
+        Else{
+            Write-Output "Last 2 531 events in 15 days are as belows:"
+        }        
+    
+    }
+
+    catch{
+        Write-Output "Some error occurred while fetching the event details."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+
+}
+
+
+<#
+-To perform CHKDSK
+#>
+Function chkdsk_check($driveLetter, $chkdsk_switch){
+    try{
+        if($chkdsk_switch){
+            if(!$driveLetter){
+                Write-Output "No drive letter has been provided, please provide a drive letter to run CHKDSK command."
+                exit
+            }        
+            Get-PSDrive $driveletter -ErrorAction Stop | Out-Null
+            $driveletter = $driveletter + ":"
+            $job = Start-Job -ScriptBlock {chkdsk "$($driveletter)"} -ArgumentList $driveletter
+            $timeout_count = 0
+
+            while($job.State -notlike "Completed" -and $timeout_count -le 750){
+                Start-Sleep 2
+                $timeout_count += 1
+
+            }
+            $Output = $Job | Receive-Job 
+            if($job.State -like "Completed"){
+                Write-Output "Output of CHKDSK command:`n$($output)"
+            }
+            else{
+                $job | Stop-Job | Out-Null
+                Write-Output  "CHKDSK (READ ONLY mode) command is taking longer than the expected time. We are forcefully terminating the CHKDSK operation after running it for 25 minutes, below is the partially completed output of the same. If any further details required then, please run the CHKDSK operation manually by logging on the server.`n"
+                Write-Output $Output
+    }
+             
+            
+            
+        }
+        else{
+            if($driveletter){
+                  Write-Output "Please select the run CHKDSK option if you want to perform the operation on $($driveLetter): drive"
+                  return
+                }
+            else{
+                  Write-Output "Please select the run CHKDSK option if you want to perform the operation, and input the driveName"
+                  return
+                }
+        }
+    }
+    catch{
+        Write-Output "Some error occurred"
+        Write-Output "[MSG: ERROR : $_.Exception.message]" 
+    }
+
+}
+
+function check_database_state($server) {
+
+	$ErrorActionPreference = "Stop"
+    try{
+        $database_state = @()
+        $database_state += Get-MailboxDatabase -Server $server -Status | Select-Object Name,Mounted,Recovery
+
+        if (!($database_state)) { Write-Output "Mailbox databases are not present on this server." }
+
+        $check_database = $database_state | Group-Object -Property Mounted
+        $check_count = $database_state | Group-Object -Property Mounted | Measure-Object
+        if ($check_database.count -eq $database_state.Count -and $check_database.Name -like "True" -and $check_count.Count -eq 1) {
+            Write-Output "All the mailbox databases are mounted on the server." 
+        }
+
+
+        else {
+            Write-Output "One or more databases are not mounted on the server. Please run 'Ex- Active manager fail to mount database script to get the databases mounted'"
+            
+        }
+
+        Write-Output "Status of the databases on $($env:ComputerName)"
+        $database_state | Format-List | Out-String
+
+	
+    }
+    catch{
+        
+        Write-Output "Some error occurred while checking the mailbox databases on this server, please check manually."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+        
+    
+    }
+
+}   
+
+
+
+Function get_event_details{
+
+    try{
+        $ESE_Event = Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 489,415,417,408; StartTime =  ((Get-Date).AddDays(-15)) } -maxevents 3 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        if(!$ESE_Event){
+            Write-Output "No recent log found"
+            Return
+        }
+        else{
+            $ESE_Event | Format-List | Out-String
+        }
+    }
+
+    catch{
+        Write-Output "Some error occurred while fetching the event details."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+
+}
+
+
+<#
+-Function to check if the server is a part of a cluster or not
+-Returns true if it is or false is it is not
+#>
+function check_cluster ($version) {
+	$ErrorActionPreference = "SilentlyContinue"
+	if ($version -ge 2010) {
+		if (Get-DatabaseAvailabilityGroup) {
+			$servers = Get-DatabaseAvailabilityGroup | Select-Object -ExpandProperty Servers | Select-Object -ExpandProperty Name
+			$result = $servers -contains $env:COMPUTERNAME
+            if($result){
+                Write-Output "The server is a part of Database Availability Group"
+            }
+            else{
+                Write-Output "The server is not a part of Database Availability Group"
+            }
+            $ResultFailed = (Get-DatabaseAvailabilityGroup) | ForEach {$_.Servers | ForEach {Test-ReplicationHealth -Server $_}} | Where-Object {$_.Result -notlike "Passed"} | Select Server, Check, Result | Format-List | Out-String
+            if($ResultFailed){
+                Write-Output "Replication test failed for the below:"
+                $ResultFailed
+            }
+            else{
+                Write-Output "Replication is working properly for the DAGs"
+            }        
+        }
+		else { Write-Output "The server is not a part of Database Availability Group"}
+	}
+	else {
+		if (Get-ClusteredMailboxServerStatus) {
+			$servers = Get-ClusteredMailboxServerStatus | Select-Object -ExpandProperty "OperationalReplicationHostNames"
+			$result = $servers -contains $env:COMPUTERNAME
+			if($result){
+                $clusterName = "2007-" + (Get-ClusteredMailboxServerStatus | Where-Object{$_.OperationalReplicationHostNames -contains $env:computername} | Select-Object -ExpandProperty Identity).Name
+                return $clusterName
+            }
+            else{
+                return $false
+            }
+		}
+		else { return $false}
+	}
+}
+
+
+
+
+function final_output($version, $clusterDetails, $server){
+    $ErrorActionPreference = "SilentlyContinue"
+
+    Write-Output "`n*****************Details of most recent ESE events 408,415,417,489 in 15 days***************************"
+    get_event_details
+    Write-Output "`n*****************Status of all the exchange services***************************"
+    Get-WmiObject Win32_Service | Where-Object{($_.Name -like "*msexch*" -or $_.Name -like "*IIS*" -or $_.Name -like "*MSExchangeRepl*")}  | Select-Object Name, State, StartMode | Format-List | Out-String
+    Write-Output "`n*****************Status of all the exchange databases***************************"
+	try {Get-MailboxDatabase -Status -ErrorAction Stop| Select-Object Name, Mounted, Recovery, Server, EDBFilePath | Format-List | Out-String}
+	catch{Write-Output "[MSG: ERROR : $($_.Exception.message)]"}
+	Write-Output "`n***************Information about Exchange server Queue******************"
+    try {Get-Queue -Server $server -ErrorAction Stop | Select-Object Identity, DeliveryType, MessageCount | Format-List | Out-String}
+    catch {
+        Write-Output "Some error occurred while fetching the que details."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+    Write-Output "`n***************Information about Database copy status******************"
+    try{
+        if($version -ne "2007"){
+            Get-MailboxDatabaseCopyStatus * | Select-Object Name, Status, ContentIndexState, CopyQueueLength, ReplayQueueLength | Format-List | Out-String
+        }
+        else {
+            Get-StorageGroupCopyStatus | Format-List identity,SummaryCopyStatus,CopyQueueLength,ReplayQueueLength | Out-String
+        }
+    }
+    catch{Write-Output "Some error occurred while fetching database copy status"
+    Write-Output "[MSG: ERROR : $($_.Exception.message)]"}
+    Write-Output "`n***************Information about Cluster******************"
+    if($version -notlike 2007){
+        Write-Output $clusterDetails
+    }
+    else{
+        if($clusterDetails -eq $false){
+            Write-Output "This server is not a part of any cluster."
+        }
+        else{
+            Write-Output "This server is a part of $(($clusterDetails -split "-")[1]) cluster."
+        }
+    }
+
+}
+
+<#
+
+#Function to check the exchange services
+#MSExchangeADTopology, MSExchangeRepl  will be checked.
+#If the services are not in runnig state, script will try to run the same using start_exchange_services function
+
+#>
+function check_services($version) {
+	$ErrorActionPreference = "Stop"
+	try {
+        if($version -ge 2010){
+            $service_status = Get-Service MSExchangeADTopology, MSExchangeRepl, MSExchangeIS | Select-Object Name,Status | Group-Object -Property Status
+            if ($service_status.count -eq 3 -and $service_status.Name -eq "Running") {
+                Write-Output "All Exchange services are running fine."
+            }
+            else {
+                Write-Output "One of the required exchange service is not running on the system."
+                Write-Output "Please get the Exchange services started with the help of Automation task 'EX-Active Manager failed to mount database'"
+                
+            }
+        }
+        else{
+            $service_status = Get-Service MSExchangeADTopology, MSExchangeIS | Select-Object Name,Status | Group-Object -Property Status
+            if ($service_status.count -eq 2 -and $service_status.Name -eq "Running") {
+                Write-Output "All Exchange services are running fine."
+            }
+            else {
+                Write-Output "One of the required exchange service is not running on the system."
+                Write-Output "Please get the Exchange services started with the help of Automation task 'EX-Active Manager failed to mount database'"
+                
+            }
+        }
+	}
+
+	catch {
+		Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+	}
+}
+
+
+
+
+<#
+-To get the event details of 507, 508, 509, 510
+#>
+Function disk_event_details{
+
+    try{
+
+        $disk_related_events    = @()
+        $disk_related_events    +=  Get-WinEvent -FilterHashtable @{ ProviderName = "NTFS";logname = 'System'; StartTime =  (Get-Date).AddDays(-15) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        $disk_related_events    +=  Get-WinEvent -FilterHashtable @{ ProviderName = "VolSnap";logname = 'System'; StartTime =  (Get-Date).AddDays(-15) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        $disk_related_events    +=  Get-WinEvent -FilterHashtable @{ ProviderName = "Disk";logname = 'System';  StartTime =  (Get-Date).AddDays(-15) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+
+        if(($disk_related_events | Where-Object{$_} | Measure-Object).count -eq 0){
+            Write-Output "No DISK or NTFS events found within 15 days time interval after most recent ESE event triggered"
+            return
+        }
+
+        Write-Output "Details of DISK/NTFS/VOLSNAP Error events occurred within 15 days of the above ESE event:`n$($disk_related_events | Format-List | Out-String)" 
+            
+    }
+
+    catch{
+        Write-Output "Some error occurred while fetching the event details."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+
+}
+
+
+#Checking Windows Backup server is configured or not and also checking whether backup is scheduled or not
+Function Check_for_Backup{
+    try{
+    
+        [double]$OSVersion = [Environment]::OSVersion.Version.ToString(2)
+        #For Windows Server 2008 R2
+        Write-Output "=================================================="
+        if ($OSVersion -eq 6.1) {
+            if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Backup\Microsoft-Windows-WindowsBackup") {
+                Write-Output "Windows server Backup is configured and scheduled on the current machine"
+            }
+            else {
+                Write-Output "Windows server Backup is not configured on the current machine"
+            }
+        }
+        elseif ($OSVersion -ge 6.2) {
+            if (!(Get-Module -Name WindowsServerBackup)) {
+                #Check Windows Server Backup Module is installed or not
+                $isWSBModuleImported = $false
+                try {
+                    #Importing WindowsServerBackup module to use Backup related commands
+                    Import-Module WindowsServerBackup -ErrorAction Stop
+                    $isWSBModuleImported = $true
+                }
+                catch {
+                    $isWSBModuleImported = $false
+                }
+            }
+            else{
+                $isWSBModuleImported = $true 
+            }
+            Write-Output "=================================================="
+            if ($isWSBModuleImported) {
+               
+                $WBPolicy = Get-WBPolicy -ErrorAction Stop
+                if ($WBPolicy) {
+                    if ((Get-WBSystemState $WBPolicy -ErrorAction Stop) -eq $true) {
+                        $ScheduledTime = Get-WBSchedule $WBPolicy -ErrorAction Stop
+                        Write-Output "Windows Server Backup is scheduled on : $ScheduledTime"
+                    }
+                }
+                else {
+                    Write-Output "No policy found on the system for Windows Server backup"
+                }
+                #Last successful backup information
+                Write-Output "=================================================="
+                $BackupInfo = Get-WBBackupSet | Where-Object { $_.BackupTime -like "$((Get-WBSummary).LastSuccessfulBackupTime)" }
+                if ($BackupInfo) {
+                    Write-Output "Last Successful Windows Server Backup Time: $($BackupInfo.BackupTime)"
+                    Write-Output "Possible Recoverable Items may include: $($BackupInfo.RecoverableItems)"
+                    $531Event = Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 531; StartTime =  (([datetime]$BackupInfo.BackupTime)); EndTime = (([datetime]$BackupInfo.BackupTime).AddHours(0.5)) } -maxevents 1 -ErrorAction SilentlyContinue | Select-Object id, message, TimeCreated
+                    if($531Event){
+                        Write-Output "531 Event is fount within 30 minutes of last scheduled restart"
+                        Write-Output $531Event
+                    }
+                    }
+                else {
+                    Write-Output "Windows Server Backup does not have backup successful backup details of Active Directory"
+                }
+
+     
+
+            }
+            else {
+                Write-Output "Module 'Windows Server Backup' is not available on the system"
+            }
+        }
+
+     
+
+        #Verify if Continuity backup software is present and services are running
+        Write-Output "=================================================="
+        $ServiceList = Get-Service -ErrorAction Stop
+        $service = $ServiceList | Where-Object { $_.Name -eq "cdp" }
+        if ($service) {
+               Write-Output "Continuity Backup services are installed." 
+               $detailsOfCDService = $Service | Select-Object Name, Status | Format-List | Out-String
+               Write-Output "Below are the details of the CDP services"
+               Write-Output $detailsOfCDService
+               try{
+                    [int]$AvgProcessUtilization = (get-counter -Counter "\Process(CDP_*)\% Processor Time" -ErrorAction Stop -SampleInterval 2 -MaxSamples 10 |select -ExpandProperty countersamples | select -ExpandProperty cookedvalue | Measure-Object -Average).average
+                    if($AvgProcessUtilization -gt 2){
+                            Write-Output "C24x7 backup is in progress on the server."
+                    } 
+                 }
+                catch{
+                    Write-Output "Unable to check if the CDP backup is running on the system."
+                }
+
+        }
+        else {
+            Write-Output "Continuity backup is not available on this machine" 
+        }
+        
+    }
+    
+    catch{
+        Write-Output "Some error occurred while fetching the event details."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+}
+
+
+
+
+<#
+- Get the details of the .edb/.log/.chk file from the log
+#>
+Function Fetch_The_File_Info{
+
+    try{
+        $Event = Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 489,408,415,417; StartTime =  ((Get-Date).AddDays(-15)) } -maxevents 3 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName
+        $Output = @()
+       
+        if(($Event | Measure-Object).Count -ne 0){
+            $Event | foreach{
+                if($_.Message -like "*`"*`"*"){
+                      $File = ((($_.Message -split "`"" | Select-String "(.edb)|(.log)|(.chk)").ToString() -replace '"') -replace "'", "").trim().Trim(".")                    
+                }
+                elseif($_.Message -like "*`'*`'*"){
+                    $File = ((($_.Message -split "`'" | Select-String "(.edb)|(.log)|(.chk)").ToString() -replace '"') -replace "'", "").trim().Trim(".")                    
+                }
+              
+                else{
+                    $File = ((($_.Message -split " " | Select-String "(.edb)|(.log)|(.chk)").ToString() -replace '"') -replace "'", "").trim().Trim(".")                    
+                }
+                $temp = [PSCustomObject]@{
+                    Log     = "$($_.ID)"
+                    Time = "$($_.TimeCreated)"
+                    File    = "$($File)"
+                }
+
+                $Output += $temp
+            }
+
+        }
+       
+
+        return $Output
+
+    }
+
+    catch{
+        return @($false, "[MSG: ERROR : $($_.Exception.message)]")
+    }
+}
+
+
+
+Function fetch_database([array]$fileName){
+
+    try{
+        $ErrorActionPreference = "Stop"
+        $result = @()
+        $flag = $false
+        if(($fileName | Measure-Object).count -eq 0 -or $fileName[0] -eq $false){
+            return @($false, "No logs found.")
+        }
+
+
+        foreach($file in $filename) {
+            if($file.File -like "*.edb"){
+                $result += Get-MailboxDatabase -Server $env:COMPUTERNAME| Select-Object Name, @{N="Path"; E = {$_.EdbFilePath.PathName}}| Where-Object {$_.Path -like $file.File} | Select-Object -ExpandProperty Name
+                $flag = $true
+            }
+            elseif($file.File -like "*.log" -or $file.File -like "*.chk"){
+                $Prefix = ($file.File -split '\\')[-1][0..2] -join ""
+                $result += Get-MailboxDatabase -Server $env:COMPUTERNAME| Where-Object {$_.LogFilePrefix -like $Prefix} | Select-Object -ExpandProperty Name
+                $flag = $true
+            }
+
+        }
+        
+        $result = @($flag) + $result
+        return $result
+    }
+
+    catch{
+
+        return @("ERROR", "[MSG: ERROR : $($_.Exception.message)]")
+
+    }
+
+}
+
+
+
+Function Fetch_event_Frequency{
+    try{
+        Write-Output "Below are the event frequencies in last 48 hours:`n"
+
+        $489_Today = (Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 489; StartTime =  ((Get-Date).AddDays(-1)) }  -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Measure-Object).Count
+        $408_Today = (Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 408; StartTime =  ((Get-Date).AddDays(-1)) }  -ErrorAction SilentlyContinue -ComputerName $env:ComputerName|  Measure-Object).Count
+        $415_Today = (Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 415; StartTime =  ((Get-Date).AddDays(-1)) }  -ErrorAction SilentlyContinue -ComputerName $env:ComputerName|  Measure-Object).Count
+        $417_Today = (Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 417; StartTime =  ((Get-Date).AddDays(-1)) }  -ErrorAction SilentlyContinue -ComputerName $env:ComputerName|  Measure-Object).Count
+        
+        Write-Output "Count of 489 today: $($489_Today)"
+        Write-Output "Count of 408 today: $($408_Today)"
+        Write-Output "Count of 415 today: $($415_Today)"
+        Write-Output "Count of 417 today: $($417_Today)"
+
+
+        $489_Yesterday = (Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 489; StartTime =  ((Get-Date).AddDays(-2)) ; EndTime =  ((Get-Date).AddDays(-1)) } -ErrorAction SilentlyContinue -ComputerName $env:ComputerName|  Measure-Object).Count
+        $408_Yesterday = (Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 408; StartTime =  ((Get-Date).AddDays(-2)) ; EndTime =  ((Get-Date).AddDays(-1)) }  -ErrorAction SilentlyContinue -ComputerName $env:ComputerName|  Measure-Object).Count
+        $415_Yesterday = (Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 415; StartTime =  ((Get-Date).AddDays(-2)) ; EndTime =  ((Get-Date).AddDays(-1)) }  -ErrorAction SilentlyContinue -ComputerName $env:ComputerName|  Measure-Object).Count
+        $417_Yesterday = (Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 417; StartTime =  ((Get-Date).AddDays(-2)) ; EndTime =  ((Get-Date).AddDays(-1)) }  -ErrorAction SilentlyContinue -ComputerName $env:ComputerName|  Measure-Object).Count
+
+
+        Write-Output "Count of 489 yesterday: $($489_yesterday)"
+        Write-Output "Count of 408 yesterday: $($408_yesterday)"
+        Write-Output "Count of 415 yesterday: $($415_yesterday)"
+        Write-Output "Count of 417 yesterday: $($417_yesterday)`n`n"
+
+        Write-Output "If the frequency of these events is high and if the Disk events are not present then we can suggest for the integrity check (command:- eseutil /g) [Need downtime] against the database [Highly recommended to consult and take proper approval from MSP]"
+
+
+
+
+    }
+
+    catch{
+        Write-Output "Some error occured while fetching the frequency of events"
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+}
+
+
+
+
+
+function new_mailbox ($password, $database) {
+	$ErrorActionPreference = "Stop"
+	try {
+		$mailbox = "Test-" + (Get-Date).ToString("MMddyyyyhhmmss")
+		$mailbox_principal_name = $mailbox + "@" + (Get-ExchangeServer $env:ComputerName).Domain
+        $database = Get-MailboxDatabase $database -ErrorAction SilentlyContinue
+
+        if($database){
+            try{    
+                New-Mailbox -Name $mailbox -Database $database -Password (ConvertTo-SecureString -String $password -AsPlainText -Force) -UserPrincipalName $mailbox_principal_name -ResetPasswordOnNextLogon $false -ErrorAction Stop | Out-Null
+            }
+            catch{
+                return @($false, "[MSG: ERROR : $($_.Exception.message)]", "")
+            }
+        }
+        else{
+            return @($false, "Unable to find the specfied database.", "")
+        }
+
+		return @($true, $mailbox)
+	}
+
+	catch {
+        return @($false, "Some Error occurred while creating the test mailbox, unable to test the external mail flow please check manually.", "[MSG: ERROR : $($_.Exception.message)]")		
+	}
+
+}
+
+
+
+
+
+try{
+
+    $WarningPreference= 'Silentlycontinue'
+    
+    #Step 1
+    $check_exchange = check_exchange
+    if($check_exchange){
+        Write-Output "The Exchange server application is not installed on this machine"
+        exit
+    }
+    $exchange_version      = check_exchange_version
+    $server_on_which_actions_are_performed = $env:computerName
+    
+    $check_cluster = check_cluster -version $exchange_Version
+    if($check_cluster -like "2007-*"){
+        $server_on_which_actions_are_performed = ($check_cluster -split "-")[1]
+    }
+
+
+    $version = (Get-ExchangeServer $server_on_which_actions_are_performed -ErrorAction Stop  | Select-Object -ExpandProperty AdminDisplayVersion).Major
+    
+    Write-Output "Exchange Version : $($exchange_Version)"
+    if((Get-Service MSExchangeIS -ErrorAction SilentlyContinue) -eq $null){
+        Write-Output "MSExchangeIS service is not present on this server, the script will work on the server(s) where MSExchangeIS service resides."
+        $check_exchange = $true
+        Exit
+    }
+
+    #Step 12
+    if($chkdsk_Switch){
+        Write-Output "==============================================================================================="
+        Write-Output "Performing chkdsk over $($driveLetter).."
+        chkdsk_check -chkdsk_switch $chkdsk_Switch -driveLetter $driveLetter
+        Exit
+    }
+
+    if($test_mailflow_switch){
+        if($exchange_Version -ge 2010){
+            Write-Output "Performing internal mailflow test over $($test_mailflow_db) on $($env:computerName)"
+            test_mailflow -version $exchange_Version -target $test_mailflow_db
+            exit
+        }
+        else{
+            Write-Output "This feature will only work for exchange 2010 and later.."
+            exit
+        }
+    }
+
+
+
+
+    [string]$role = Get-ExchangeServer $server_on_which_actions_are_performed -ErrorAction Stop | Select -ExpandProperty ServerRole  
+    Write-Output "Roles present on the machine : $($role)"
+
+    #Step 2
+    Write-Output "==============================================================================================="
+    check_services
+
+
+    #Step 3 & 4
+    Write-Output "==============================================================================================="
+    Write-Output "489/408/415/417 log found, below are the details:`n"
+    [array]$Files_In_Log = Fetch_The_File_Info
+    if(($Files_In_Log | Measure-Object).Count -eq 0){
+        Write-Output "No 489/408/415/417 logs found on the system."
+    }
+    else{
+        if($Files_In_Log[0] -eq $false) {
+            Write-Output "Some error occurred while fetching the logs"
+            Write-Output $Files_In_Log[1]
+        }
+        else {
+            $Files_In_Log | ForEach-Object {
+                Write-Output "Path : $($_.File)"
+                Write-Output "Log : $($_.Log)"
+                Write-Output "TimeCreated : $($_.Time)"
+                Write-Output "Path exists : $(Test-Path $_.File)`n`n"
+            }
+        }
+    }
+
+    #Step 5
+    Write-Output "==============================================================================================="
+    Get-WmiObject -Class Win32_logicaldisk -Filter "DriveType = '3'" -ComputerName $env:COMPUTERNAME | 
+        Select-Object DeviceID, DriveType, ProviderName, @{n="FreeSpace"; e= {([Math]::Round($_.FreeSpace / 1GB, 2)).toString() + " GB"}}, @{n="Size"; e= {([Math]::Round($_.Size / 1GB, 2)).toString() + " GB"}}, VolumeName 
+    Write-Output "These type of warning events indicate that the database engine is unable to write to the file. Low disk space could be one of the reason for the same. Please check the above output and confirm if we have sufficient space on the drive."
+    
+    #Step 6
+    Write-Output "==============================================================================================="
+    check_database_state -server $server_on_which_actions_are_performed
+    
+    #Step 7
+    Write-Output "==============================================================================================="
+    if($exchange_Version -eq 2007){
+        Write-Output "Tetsing mailflow over $($server_on_which_actions_are_performed)"
+        test_mailflow -version $exchange_Version -target $server_on_which_actions_are_performed
+    }
+    else{
+        $databases = @()
+        $databases = fetch_Database -fileName $Files_In_Log
+        if($databases[0] -eq $false -or !$databases){
+            Write-Output "No event found OR the file path we got in the event is not associated with any Mailbox Database"
+        }
+        elseif ($databases[0] -eq $true){
+            Write-Output "Performing internal mailflow test over $($databases[1]) as it's one of the database found in the log"
+            test_mailflow -version $exchange_Version -target $databases[1]
+        }
+        elseif ($databases[0] -eq "ERROR") {
+            Write-Output "Some error occurred while fetching the databases."
+            Write-Output $databases[1]
+        }
+    }
+
+    #Step 8
+    Write-Output "==============================================================================================="
+    disk_event_details
+
+    #Step 9
+    Write-Output "==============================================================================================="
+    Fetch_event_Frequency
+
+    #Step 10
+    Write-Output "==============================================================================================="
+    Check_for_Backup
+
+
+    #Step 11
+    Write-Output "==============================================================================================="
+    if($exchange_Version -notlike 2007){
+        if($new_mailbox_switch){
+            if($null -ne $password -and $null -ne $databases){
+                $Mailbox = new_mailbox -password $password -database $database_from_user
+
+                if($Mailbox[0] -like $true){
+                    Write-Output "Mailbox has been created successfully."
+                    Write-Output "Mailbox Name : $($Mailbox[1])"
+                }
+        
+                else{
+                    Write-Output "Some error occurred while creating the mailbox"
+                    Write-Output "$($Mailbox[1..2] -join "`n")"
+                }
+            }
+            else{
+                Write-Output "Please specify the name of the datbase and the password associated with the mailbox to create the same."
+            }
+        
+        }
+
+        else{
+            Write-Output "You may try creating a new mailbox by selecting the switch to create a new mailbox on the databases found in the logs. The switch will create new mailbox and delete the same at the end of script which will confirm the database write operation is working and it's not locked by any application, service etc.`n"
+            Write-Output "Following are the databases from the events corresponding to the event: "
+            if($databases[0] -like $true){  
+                Write-Output $databases[1..($databases.Length-1)]
+            }
+            else {
+                Write-Output "No event/database found in the recent event logs."
+            }
+        }
+    
+
+    }
+    else{
+        Write-Output "Creating mailbox feature will only work in case of 2010 or higher version of exchange"
+        Write-Output "In case of Exchange 2007 please try creating the mailbox manually."
+    }
+
+
+    Write-Output "==============================================================================================="
+    check_drive_path
+
+    
+}
+
+catch{
+    Write-Output "Some error occurred."
+    Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+}
+
+finally{
+    if($check_exchange){exit}
+    if($chkdsk_Switch){exit}
+    if($test_mailflow_switch){exit}
+    
+    if($Mailbox){
+    if($Mailbox[0] -eq $true){
+        try{
+            Remove-Mailbox $Mailbox[1] -confirm:$false -ErrorAction Stop
+            Write-Output "$($Mailbox[1]) is removed successfully."
+        }
+        catch{
+            Write-Output "Some error occurred while removing $($Mailbox[1]), please REMOVE manually after logging on to the server."
+            Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+        }
+    }
+    }
+    
+    Write-Output "`n==============================================================================================="
+    Write-Output "===============================================================================================`n"
+
+    final_output -version $exchange_Version -clusterDetails $check_cluster -server $server_on_which_actions_are_performed
+}

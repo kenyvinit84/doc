@@ -1,0 +1,822 @@
+<#
+.SYNOPSIS
+                The database engine attempted a clean write operation on page of database Drive.
+                
+.DESCRIPTION
+                The script will be run by the tech to check the following details:
+                    1. Checks whether Exchange is present on the machine or not.
+                    2. Checks the exchange version
+                    3. Checks the roles installed on the exchange server
+                    4. Checks the mailbox database status
+                    5. Checks the internal mailflow test
+                    6. Checks the copy status in case of DAG
+                    7. Checks the mail queue and prints the same
+                    8. Checks for ESE event ids and corresponding DISK/NTF/VolSnap events
+                    9. Checks the read/write speed  of logical and the physical disks
+                    10. Checks the top 5 processes utilizing high read and write IOs
+                    11. Performs diskcheck on the disk input by the user
+                    12. Check the Backup job state and 531 log corresponding to the same
+
+.NOTES    
+                Name: DatabaseEngineattemptedCleanWrite.ps1
+				Author: <Abhishek Trivedi - GRT, Continuum>
+				Version: 1.2
+                Created On : 28-10-2019
+                Updated On : 12-12-2019
+                Reference JIRA : GRT-5274 
+
+.PARAMETERS One Parameter:
+                    1. $driveLetter                 : Drive letter by the user on which the dirty disk test(fsutil) will be performed. [TextBox]
+                    2. $chkdsk_Switch               : Should be true to perform chkdsk [Boolean]
+                    3. $MailboxDatabaseForRepair    : Database for repair [TextBox]
+                    4. $MailboxRepairRequest_Switch : Database repair switch [Boolean]
+#>
+
+<#
+$MailboxDatabaseForRepair    = "ASHWFIVNC" 
+$MailboxRepairRequest_Switch = $true
+$driveLetter                 ="C"
+$chkdsk_Switch               = $true
+#>
+
+
+if($Case -eq "chkdsk_Switch"){
+    $chkdsk_Switch = $true
+    $MailboxRepairRequest_Switch = $false
+}
+
+if($Case -eq "MailboxRepairRequest_Switch"){
+    $MailboxRepairRequest_Switch = $true
+    $chkdsk_Switch = $false
+}
+
+
+if(!$driveLetter){
+    $driveLetter = $false
+}
+
+
+if($chkdsk_Switch -ne $true)
+{
+    $chkdsk_Switch = $false
+    $driveLetter = $false
+}
+
+
+if($MailboxRepairRequest_Switch -ne $true)
+{
+    $MailboxRepairRequest_Switch = $false
+    $MailboxDatabaseForRepair = $false
+}
+
+if(!$MailboxDatabaseForRepair)
+{
+    $MailboxDatabaseForRepair = $false
+}
+
+
+<# Architecture check started and PS changed to the OS compatible #>
+if ($env:PROCESSOR_ARCHITEW6432 -eq "AMD64") {
+	Write-Warning "Excecuting the script under 64 bit powershell"
+	if ($myInvocation.Line) {
+		& "$env:systemroot\sysnative\windowspowershell\v1.0\powershell.exe" -NonInteractive -NoProfile $myInvocation.Line
+	} else {
+		& "$env:systemroot\sysnative\windowspowershell\v1.0\powershell.exe" -NonInteractive -NoProfile -File "$($myInvocation.InvocationName)" $args
+	}
+	exit $lastexitcode
+}
+<#Architecture check completed #>
+
+<# Compatibility check if found incompatible will exit #>
+try {
+	[double]$OSVersion = [Environment]::OSVersion.Version.ToString(2)
+	$PSVersion = (Get-Host).Version
+	if (($OSVersion -lt 6.1) -or ($PSVersion.Major -lt 2))
+	{
+		Write-Output "[MSG: System is not compatible with the requirement. Either machine is below Windows 7 / Windows 2008 R2 or PowerShell version is lower than 2.0]"
+		exit
+	}
+} catch { Write-Output "[MSG: ERROR : $_.Exception.message]" }
+<# Compatibility Check Code Ends #>
+
+
+
+
+
+<#
+-Function to check if the server is an exchange server or not
+-Checks whether MSExchangeServiceHost is present or not
+-Looks for the PSSnapin of Exchange, if not present installs the same
+#>
+function check_exchange {
+	$ErrorActionPreference = "SilentlyContinue"
+	if (!(Get-Service -Name MSExchangeServiceHost -ComputerName $env:computername)) {
+		return $true	
+	}
+
+	if (!(Get-PSSnapin *Exchange*)) {
+		Add-PSSnapin *Exchange*
+	}
+}
+
+
+
+function check_exchange_version{
+
+	$exchange_build_number =  Get-Command ExSetup | ForEach-Object {$_.FileVersionInfo} | Select-Object -ExpandProperty ProductVersion                
+	$build         =  0.0 + $exchange_build_number.SubString(0,5)
+
+    if($build -ge 6 -and $build -lt 8){
+	Return "2003"}
+    elseif($build -ge 8 -and $build -lt 14){
+	Return "2007"}
+    elseif($build -ge 14 -and $build -lt 15){
+	Return "2010"}
+    elseif($build -ge 15.0 -and $build -lt 15.01){
+	Return "2013"}
+    elseif($build -ge 15.01 -and $build -lt 15.02){
+	Return "2016"}
+	elseif($build -ge 15.02){
+    Return "2019"}
+	else{
+	Return $false}
+}
+
+
+
+<# 
+-Function to check whether the databases are mounted or not 
+#>
+function check_database_state {
+
+	$ErrorActionPreference = "Stop"
+    try{
+        $database_state = @()
+        $database_state += Get-MailboxDatabase -Server $env:computername -Status | Select-Object Name,Mounted,Recovery
+
+        if (!($database_state)) { Write-Output "Mailbox databases are not present on this server." }
+
+        $check_database = $database_state | Group-Object -Property Mounted
+        $check_count = $database_state | Group-Object -Property Mounted | Measure-Object
+        if ($check_database.count -eq $database_state.Count -and $check_database.Name -like "True" -and $check_count.Count -eq 1) {
+            Write-Output "All the mailbox databases are mounted on the server." 
+        }
+
+
+        else {
+            Write-Output "One or more databases are not mounted on the server. Please run 'Ex- Active manager fail to mount database script to get the databases mounted'"
+            
+        }
+
+        Write-Output "Status of the databases on $($env:ComputerName)"
+        $database_state | Format-List | Out-String
+
+	
+    }
+    catch{
+        
+        Write-Output "Some error occurred while checking the mailbox databases on this server, please check manually."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+        
+    
+    }
+
+}   
+
+
+<#
+-Function to check the result of mail flow test on all the databases on the server
+-return false if the test fails for any of the database on the server
+-It will also inform the tech about the databases for which the mail flow test is failed
+#>
+function test_mailflow{
+    
+    $ErrorActionPreference = "SilentlyContinue"
+    
+try{
+    $test_mailflow = Test-Mailflow -TargetMailboxServer $env:COMPUTERNAME -ExecutionTimeout 120
+    if($test_mailflow.testmailflowresult -notlike "*Success*"){
+        Write-Output "Internal mailflow is not working properly."
+    }
+    else{
+        Write-Output "Internal MailFlow is working fine on the server."        
+    }
+
+    if($test_mailflow){
+        Write-Output "Following is the result of Test-Mailflow command:"
+        $test_mailflow | Format-List | Out-String
+    }
+    else {
+        Write-Output "Unable to fetch the output of the mailflow test."
+    }
+}
+
+catch{
+    Write-Output "[MSG: ERROR : $($_.Exception.message)]"   
+}
+}
+
+
+<#
+-Function to check if the server is a part of a cluster or not
+-Returns true if it is or false is it is not
+#>
+function check_cluster ($version) {
+	$ErrorActionPreference = "SilentlyContinue"
+	if ($version -ge 2010) {
+		if (Get-DatabaseAvailabilityGroup) {
+			$servers = Get-DatabaseAvailabilityGroup | Select-Object -ExpandProperty Servers | Select-Object -ExpandProperty Name
+			$result = $servers -contains $env:COMPUTERNAME
+			Write-Output "The server is a part of Database Availability Group"
+		    $ResultFailed = (Get-DatabaseAvailabilityGroup) | ForEach {$_.Servers | ForEach {Test-ReplicationHealth -Server $_}} | Where-Object {$_.Result -notlike "Passed"} | Select Server, Check, Result | Format-List | Out-String
+            if($ResultFailed){
+                Write-Output "Replication test failed for the below:"
+            }        
+        }
+		else { Write-Output "The server is not a part of Database Availability Group"}
+	}
+	else {
+		if (Get-ClusteredMailboxServerStatus) {
+			$servers = Get-ClusteredMailboxServerStatus | Select-Object -ExpandProperty "OperationalMachines"
+			$result = $servers -contains $env:COMPUTERNAME
+			Write-Output "The server is a part of Clustered Mailbox Group"
+		}
+		else { Write-Output "The server is not a part of Clustered Mailbox Group" }
+	}
+}
+
+
+<#
+-Function to check the Read/Sec and Write/Sec for Physical and Logical disks
+#>
+Function Check_Disk_read_Write {
+    $ErrorActionPreference = "Stop"
+    try{    
+        $physical_disk_read_per_sec = [math]::Round((Get-Counter -Counter "\PhysicalDisk(_Total)\Avg. Disk sec/Read" -SampleInterval 5 -MaxSamples 3 | 
+            Select-Object -ExpandProperty countersamples |
+                Select-Object -ExpandProperty cookedvalue |
+                    Measure-Object -Average).Average, 4)
+        Write-Output "Physical Disk sec/read : $($physical_disk_read_per_sec) Seconds"
+        if($physical_disk_read_per_sec -ge .02){
+            Write-Output "The sec/read is too high(more than 20MS), please check the disk manually."
+        }
+        Write-Output ""
+       }
+    catch{
+        Write-Output "Some error occurred while fetching the sec/read performance data for Physical Disk."
+    }
+
+    try{
+        $physical_disk_write_per_sec = [math]::Round((Get-Counter -Counter "\LogicalDisk(_Total)\Avg. Disk sec/Write" -SampleInterval 5 -MaxSamples 3 | 
+            Select-Object -ExpandProperty countersamples | 
+                Select-Object -ExpandProperty cookedvalue | 
+                    Measure-Object -Average).Average, 4)
+        Write-Output "Physical Disk sec/write : $($physical_disk_write_per_sec) Seconds"
+        if($physical_disk_write_per_sec -ge .1){
+            Write-Output "The sec/write is too high(more than 100MS), please check the disk manually."
+        }
+        Write-Output ""
+                
+        }
+    catch{
+        Write-Output "Some error occurred while fetching the sec/read performance data for Physical Disk."
+    }
+
+
+    try{
+        $logical_disk_write_per_sec = [math]::Round((Get-Counter -Counter "\LogicalDisk(_Total)\Avg. Disk sec/Write" -SampleInterval 5 -MaxSamples 3 | 
+            Select-Object -ExpandProperty countersamples | 
+                Select-Object -ExpandProperty cookedvalue | 
+                    Measure-Object -Average).average, 4)
+        Write-Output "Logical Disk sec/write : $($logical_disk_write_per_sec) Seconds"
+        if($logical_disk_write_per_sec -ge .1){
+            Write-Output "The sec/write is too high(more than 100MS), please check the disk manually."
+        }
+        Write-Output ""        
+        }
+    catch{
+        Write-Output "Some error occurred while fetching the sec/write performance data for Logical Disk."
+    }
+
+    try{
+        $logical_disk_read_per_sec = [math]::Round((Get-Counter -Counter "\LogicalDisk(_Total)\Avg. Disk sec/Read"  -SampleInterval 5 -MaxSamples 3 | 
+            Select-Object -ExpandProperty countersamples | 
+                Select-Object -ExpandProperty cookedvalue | 
+                    Measure-Object -Average).average, 4)
+        Write-Output "Logical Disk sec/write : $($logical_disk_read_per_sec) Seconds"
+        if($logical_disk_read_per_sec -ge .02){
+            Write-Output "The sec/write is too high(more than 20MS), please check the disk manually."
+        }
+        Write-Output "" 
+
+        }
+    catch{
+        Write-Output "Some error occurred while fetching the sec/read performance data for Logical Disk."
+    }
+
+
+
+}
+
+<#
+-Function to check the Read/Sec and Write/Sec for processes
+#>
+Function get_top_Processes{
+ 
+    $ErrorActionPreference = "SilentlyContinue"
+    $perfomancedata = Get-WmiObject Win32_PerfFormattedData_PerfProc_Process 
+ 
+ 
+    $top_five_process_by_read = $perfomancedata | 
+                                    Sort-Object IOReadBytesPersec -Descending | 
+                                            Select-Object  Name,IOReadBytesPersec |
+                                                        Where-Object{$_.Name -notlike "_Total" -and $_.Name -notlike "IDLE"} | 
+                                                                    Select -First 5 | 
+                                                                            Format-List |
+                                                                                   Out-String
+ 
+    $top_five_process_by_Write = $perfomancedata | 
+                                    Sort-Object IOWriteBytesPersec -Descending | 
+                                            Select-Object  Name,IOWriteBytesPersec |
+                                                        Where-Object{$_.Name -notlike "_Total" -and $_.Name -notlike "IDLE"} | 
+                                                                    Select -First 5 | 
+                                                                            Format-List |
+                                                                                  Out-String         
+        if($top_five_process_by_read){
+            Write-Output "Below are the top five process having the highest read rates."
+            Write-Output $top_five_process_by_read
+        }
+        else{
+            Write-Output "`n*Some Error Occurred while fetching the processes by read*`n"
+        }
+ 
+        if($top_five_process_by_Write){
+            Write-Output "Below are the top five process having the highest write rates."
+            Write-Output $top_five_process_by_Write
+        }
+        else{
+            Write-Output "`n*Some Error Occurred while fetching the processes by write*`n"
+ 
+        }
+
+ 
+
+}
+
+
+
+
+<#
+-To tun FSUTIL against the all the local drives
+#>
+
+Function check_drive_path{
+ 
+    try{
+       
+       foreach($driveLetter in (Get-WmiObject win32_logicaldisk | ?{$_.DriveType -eq 3} | Select -ExpandProperty Name)){
+
+            $sysvolInfo = Get-WmiObject -Class Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $driveLetter } | Select-Object DeviceID, FileSystem, @{L = 'PercentFree'; E = { "{0:N2}" -f (($_.freespace / $_.size) * 100) } }, @{n = "FreeSpace"; e = { [math]::Round($_.FreeSpace / 1GB, 2) } }, @{L = 'Dirty Status'; E = { fsutil dirty query $_.DeviceID } }
+            if($sysvolInfo){
+                Write-Output "Below are the result of FSUTIL command over $($driveLetter) drive`n$($sysvolInfo | Format-List | Out-String)"
+            }
+            else{
+                Write-Output "Unable to fetch the device Information for $($driveLetter)"
+            }
+       }
+   
+    }
+   
+    catch{
+       Write-Output "Some error occurred while checking the $($driveLetter) drive."
+       Write-Output "[MSG: ERROR : $_.Exception.message]" 
+    }
+}
+
+
+
+
+<#
+-To get the event details of 531
+#>
+Function get_event_details_531{
+
+    try{
+        $Event531 = @()
+        $Event531 += Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 531; StartTime =  ((Get-Date).AddDays(-15)) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        if(!$Event531){
+            Write-Output "No most recent performance related ESE events found"
+            Return
+        }
+        Else{
+            Write-Output "Last 2 531 events in 15 days are as belows:"
+        }        
+    
+    }
+
+    catch{
+        Write-Output "Some error occurred while fetching the event details."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+
+}
+
+
+<#
+-To perform CHKDSK
+#>
+Function chkdsk_check($driveLetter, $chkdsk_switch){
+    try{
+        if($chkdsk_switch){
+            if(!$driveLetter){
+                Write-Output "No drive letter has been provided, please provide a drive letter to run CHKDSK command."
+                exit
+            }        
+            Get-PSDrive $driveletter -ErrorAction Stop | Out-Null
+            $driveletter = $driveletter + ":"
+            $job = Start-Job -ScriptBlock {chkdsk "$($driveletter)"} -ArgumentList $driveletter
+            $timeout_count = 0
+
+            while($job.State -notlike "Completed" -and $timeout_count -le 750){
+                Start-Sleep 2
+                $timeout_count += 1
+
+            }
+            $Output = $Job | Receive-Job 
+            if($job.State -like "Completed"){
+                Write-Output "Output of CHKDSK command:`n$($output)"
+            }
+            else{
+                $job | Stop-Job | Out-Null
+                Write-Output  "CHKDSK (READ ONLY mode) command is taking longer than the expected time. We are forcefully terminating the CHKDSK operation after running it for 25 minutes, below is the partially completed output of the same. If any further details required then, please run the CHKDSK operation manually by logging on the server.`n"
+                Write-Output $Output
+    }
+             
+            
+            
+        }
+        else{
+            if($driveletter){
+                  Write-Output "Please select the run CHKDSK option if you want to perform the operation on $($driveLetter): drive"
+                  return
+                }
+            else{
+                  Write-Output "Please select the run CHKDSK option if you want to perform the operation, and input the driveName"
+                  return
+                }
+        }
+    }
+    catch{
+        Write-Output "Some error occurred"
+        Write-Output "[MSG: ERROR : $_.Exception.message]" 
+    }
+
+}
+
+
+
+
+
+function final_output{
+    $ErrorActionPreference = "SilentlyContinue"
+
+    Write-Output "`n*****************Details of recent 531 events in 15 days***************************"
+    get_event_details_531
+    Write-Output "`n*****************Status of all the exchange services***************************"
+    Get-WmiObject Win32_Service | Where-Object{($_.Name -like "*msexch*" -or $_.Name -like "*IIS*" -or $_.Name -like "*MSExchangeRepl*")}  | Select-Object Name, State, StartMode | Format-List | Out-String
+    Write-Output "`n*****************Status of all the exchange databases***************************"
+	try {Get-MailboxDatabase -Status -ErrorAction Stop| Select-Object Name, Mounted, Recovery, Server | Format-List | Out-String}
+	catch{Write-Output "[MSG: ERROR : $($_.Exception.message)]"}
+	Write-Output "`n***************Information about Exchange server******************"
+	try{Get-ExchangeServer -Status -ErrorAction Stop |Select-Object Name, CurrentDomainControllers, CurrentConfigDomainController, FQDN,ServerRole,Site,AdminDisplayVersion,Edition | Format-List  | Out-String}
+    catch {Write-Output "[MSG: ERROR : $($_.Exception.message)]"}
+    Write-Output "`n***************Information about Database copy status******************"
+    try{Get-MailboxDatabaseCopyStatus * | Select-Object Name, Status, ContentIndexState, CopyQueueLength, ReplayQueueLength | Format-List | Out-String}
+    catch{Write-Output "Some error occurred while fetching database copy status"
+    Write-Output "[MSG: ERROR : $($_.Exception.message)]"}
+    Write-Output "`n***************Information about VSSWriters******************"
+    try{
+        $vssWriters =  vssadmin list writers
+        if($vssWriters){
+            Write-Output $vssWriters
+        }
+        else{
+            Write-Output "No VSS writer found"
+        }
+    }
+    catch{
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+
+}
+
+
+<#
+
+#Function to check the exchange services
+#MSExchangeADTopology, MSExchangeRepl  will be checked.
+#If the services are not in runnig state, script will try to run the same using start_exchange_services function
+
+#>
+function check_services {
+	$ErrorActionPreference = "Stop"
+	try {
+		$service_status = Get-Service MSExchangeADTopology, MSExchangeRepl, MSExchangeIS | Select-Object Name,Status | Group-Object -Property Status
+		if ($service_status.count -eq 3 -and $service_status.Name -eq "Running") {
+			Write-Output "All Exchange services are running fine."
+		}
+		else {
+            Write-Output "One of the required exchange service is not running on the system."
+            Write-Output "Please get the Exchange services started with the help of Automation task 'EX-Active Manager failed to mount database'"
+			
+		}
+	}
+
+	catch {
+		Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+	}
+}
+
+
+
+
+<#
+-To get the event details of 507, 508, 509, 510
+#>
+Function get_event_details{
+
+    try{
+        $ESE_Event = Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 531; StartTime =  ((Get-Date).AddDays(-15)) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        
+        if(!$ESE_Event){
+            Write-Output "No most recent performance related ESE events found"
+            Return
+        }
+        
+        $recent_event           = $ESE_Event | Sort-Object -Property TimeCreated | Select-Object -First 2
+        [datetime]$time_created = $recent_event[0].TimeCreated
+
+        if($ESE_Event){
+            Write-Output "Details of most recent ESE event:`n$($recent_event | Format-List | Out-String)"
+        }
+
+        $disk_related_events    = @()
+        $disk_related_events    +=  Get-WinEvent -FilterHashtable @{ ProviderName = "NTFS";logname = 'System'; StartTime =  ($time_created.AddMinutes(-15)); EndTime =  ($time_created.AddMinutes(15)) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        $disk_related_events    +=  Get-WinEvent -FilterHashtable @{ ProviderName = "VolSnap";logname = 'System'; StartTime =  ($time_created.AddMinutes(-15)); EndTime =  ($time_created.AddMinutes(15)) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        $disk_related_events    +=  Get-WinEvent -FilterHashtable @{ ProviderName = "Disk";logname = 'System';  StartTime =  ($time_created.AddMinutes(-15)); EndTime =  ($time_created.AddMinutes(15)) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+
+        if(($disk_related_events | Where-Object{$_} | Measure-Object).count -eq 0){
+            Write-Output "No DISK or NTFS events found within 15 Days time interval after most recent ESE event triggered"
+            return
+        }
+
+        Write-Output "Details of DISK/NTFS/VOLSNAP events occurred within 15 Days of the above ESE event:`n$($disk_related_events | Format-List | Out-String)" 
+            
+    }
+
+    catch{
+        Write-Output "Some error occurred while fetching the event details."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+
+}
+
+
+#Checking Windows Backup server is configured or not and also checking whether backup is scheduled or not
+Function Check_for_Backup{
+    try{
+    
+        [double]$OSVersion = [Environment]::OSVersion.Version.ToString(2)
+        #For Windows Server 2008 R2
+        Write-Output "=================================================="
+        if ($OSVersion -eq 6.1) {
+            if (Test-Path "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\Microsoft\Windows\Backup\Microsoft-Windows-WindowsBackup") {
+                Write-Output "Windows server Backup is configured and scheduled on the current machine"
+            }
+            else {
+                Write-Output "Windows server Backup is not configured on the current machine"
+            }
+        }
+        elseif ($OSVersion -ge 6.2) {
+            if (!(Get-Module -Name WindowsServerBackup)) {
+                #Check Windows Server Backup Module is installed or not
+                $isWSBModuleImported = $false
+                try {
+                    #Importing WindowsServerBackup module to use Backup related commands
+                    Import-Module WindowsServerBackup -ErrorAction Stop
+                    $isWSBModuleImported = $true
+                }
+                catch {
+                    $isWSBModuleImported = $false
+                }
+            }
+            else{
+                $isWSBModuleImported = $true 
+            }
+            Write-Output "=================================================="
+            if ($isWSBModuleImported) {
+               
+                $WBPolicy = Get-WBPolicy -ErrorAction Stop
+                if ($WBPolicy) {
+                    if ((Get-WBSystemState $WBPolicy -ErrorAction Stop) -eq $true) {
+                        $ScheduledTime = Get-WBSchedule $WBPolicy -ErrorAction Stop
+                        Write-Output "Windows Server Backup is scheduled on : $ScheduledTime"
+                    }
+                }
+                else {
+                    Write-Output "No policy found on the system for Windows Server backup"
+                }
+                #Last successful backup information
+                Write-Output "=================================================="
+                $BackupInfo = Get-WBBackupSet | Where-Object { $_.BackupTime -like "$((Get-WBSummary).LastSuccessfulBackupTime)" }
+                if ($BackupInfo) {
+                    Write-Output "Last Successful Windows Server Backup Time: $($BackupInfo.BackupTime)"
+                    Write-Output "Possible Recoverable Items may include: $($BackupInfo.RecoverableItems)"
+                    $531Event = Get-WinEvent -FilterHashtable @{ logname = 'application'; id = 531; StartTime =  (([datetime]$BackupInfo.BackupTime)); EndTime = (([datetime]$BackupInfo.BackupTime).AddHours(0.5)) } -maxevents 1 -ErrorAction SilentlyContinue | Select-Object id, message, TimeCreated
+                    if($531Event){
+                        Write-Output "531 Event is fount within 30 minutes of last scheduled restart"
+                        Write-Output $531Event
+                    }
+                    }
+                else {
+                    Write-Output "Windows Server Backup does not have backup successful backup details of Active Directory"
+                }
+
+     
+
+            }
+            else {
+                Write-Output "Module 'Windows Server Backup' is not available on the system"
+            }
+        }
+
+     
+
+        #Verify if Continuity backup software is present and services are running
+        Write-Output "=================================================="
+        $ServiceList = Get-Service -ErrorAction Stop
+        $service = $ServiceList | Where-Object { $_.Name -eq "cdp" }
+        if ($service) {
+               Write-Output "Continuity Backup services are installed." | Out-String
+               $detailsOfCDService = $Service | Select Name, Status 
+               Write-Output "Below are the details of the CDP services"
+               Write-Output $detailsOfCDService
+               
+               [int]$AvgProcessUtilization = (get-counter -Counter "\Process(CDP)\% Processor Time" -SampleInterval 2 -MaxSamples 10 |select -ExpandProperty countersamples | select -ExpandProperty cookedvalue | Measure-Object -Average).average
+               if($AvgProcessUtilization -gt 2){
+                    Write-Output "C24x7 backup is in progress on the server."
+               } 
+        }
+        else {
+            Write-Output "Continuity backup is not available on this machine" 
+        }
+        
+    }
+    
+    catch{
+        Write-Output "Some error occurred while fetching the event details."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+}
+
+Function MailboxRepairRequest($MailboxRepairRequest_Switch, $MailboxDatabaseForRepair){
+    try{
+        if($MailboxRepairRequest_Switch -eq $true){
+            if(!$MailboxDatabaseForRepair){
+                Write-Output "Please provide a mailbox database on which the repair needs to be performed."
+                Return
+            }
+
+            $check_database = Get-MailboxDatabase -ErrorAction Stop | Where-Object{$_.Name -like "$($MailboxDatabaseForRepair)"}
+            if($check_database){
+                New-MailboxRepairRequest -Database $MailboxDatabaseForRepair -CorruptionType ProvisionedFolder,SearchFolder,AggregateCounts,Folderview | Format-List | Out-String
+                Write-Output "Repair request initiated successfully."
+                return
+            }
+            
+            $check_database = Get-PublicFolderDatabase -ErrorAction Stop | Where-Object{$_.Name -like "$($MailboxDatabaseForRepair)"} 
+            if($check_database){
+                New-PublicFolderDatabaseRepairRequest -Database $MailboxDatabaseForRepair -CorruptionType ReplState |  Format-List | Out-String
+                Write-Output "Repair request initiated successfully."
+                return
+            }
+            if(!$check_database){
+                Write-Output "Unable to find $($MailboxDatabaseForRepair) to perform the repair."
+            }
+        
+        }
+        else{
+            Write-Output "You may try runnnig the online mailbox/public folder repair by selecting the switch after providing the database name and running the script again."
+        }
+    }
+
+    catch{
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+}
+
+<#
+-To get the event details of 507, 508, 509, 510
+#>
+Function disk_event_details{
+
+    try{
+
+        $disk_related_events    = @()
+        $disk_related_events    +=  Get-WinEvent -FilterHashtable @{ ProviderName = "NTFS";logname = 'System'; StartTime =  (Get-Date).AddDays(-15) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        $disk_related_events    +=  Get-WinEvent -FilterHashtable @{ ProviderName = "VolSnap";logname = 'System'; StartTime =  (Get-Date).AddDays(-15) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+        $disk_related_events    +=  Get-WinEvent -FilterHashtable @{ ProviderName = "Disk";logname = 'System';  StartTime =  (Get-Date).AddDays(-15) } -maxevents 1 -ErrorAction SilentlyContinue -ComputerName $env:ComputerName| Select-Object id, message, TimeCreated
+
+        if(($disk_related_events | Where-Object{$_} | Measure-Object).count -eq 0){
+            Write-Output "No DISK or NTFS events found within 15 days time interval after most recent ESE event triggered"
+            return
+        }
+
+        Write-Output "Details of DISK/NTFS/VOLSNAP Error events occurred within 15 days of the above ESE event:`n$($disk_related_events | Format-List | Out-String)" 
+            
+    }
+
+    catch{
+        Write-Output "Some error occurred while fetching the event details."
+        Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    }
+}
+
+
+
+
+try{
+
+    $WarningPreference= 'Silentlycontinue'
+    
+    $check_exchange = check_exchange
+    if($check_exchange){
+        Write-Output "The Exchange server application is not installed on this machine"
+        exit
+    }
+    $exchange_version      = check_exchange_version
+    if([int]$exchange_Version -ne 2010){
+        Write-Output "The script will work only on exchange 2010 server, you are running it on $($exchange_Version). Please check manually."
+        $check_exchange = $true
+        Exit
+    }
+
+    Write-Output "Exchange Version : $($exchange_Version)"
+   
+  
+    if($chkdsk_Switch){
+        Write-Output "==============================================================================================="
+        chkdsk_check -chkdsk_switch $chkdsk_Switch -driveLetter $driveLetter
+        $check_exchange = $true
+        Exit
+    }
+
+    [string]$role = Get-ExchangeServer $env:COMPUTERNAME -ErrorAction Stop | Select -ExpandProperty ServerRole  
+
+    if($role -notlike "*Mailbox*"){
+        Write-Output "Mailbox role is not present on this server, the script will only work on the server with the mailbox role present."
+        $check_exchange = $true
+        exit
+    }
+
+    Write-Output "Roles present on the machine : $($role)"
+    Write-Output "==============================================================================================="
+    check_services
+    Write-Output "==============================================================================================="
+    check_database_state
+    Write-Output "==============================================================================================="
+    test_mailflow
+    Write-Output "==============================================================================================="
+    get_event_details
+    Write-Output "==============================================================================================="
+    disk_event_details
+    Write-Output "==============================================================================================="
+    Check_Disk_read_Write
+    Write-Output "==============================================================================================="
+    get_top_Processes
+    Write-Output "==============================================================================================="
+    Check_for_Backup
+    Write-Output "==============================================================================================="
+    check_cluster -version $exchange_version
+    Write-Output "==============================================================================================="
+    MailboxRepairRequest -MailboxRepairRequest_Switch $MailboxRepairRequest_Switch -MailboxDatabaseForRepair $MailboxDatabaseForRepair
+    Write-Output "==============================================================================================="
+    check_drive_path
+    
+}
+
+catch{
+    Write-Output "Some error occurred."
+    Write-Output "[MSG: ERROR : $($_.Exception.message)]"
+    $check_exchange = $true
+}
+
+finally{
+
+    if($check_exchange){exit}
+    
+    Write-Output "`n===============================================================================================`n"
+
+
+    final_output 
+}
