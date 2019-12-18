@@ -1,0 +1,15 @@
+{
+    "case": {
+      "classNames": "col-sm-12",
+      "ui:placeholder": "Select"
+    },
+    "driveLetter": {
+      "classNames": "col-sm-7",
+      "ui:help": "Single Drive Letter at a time, Example C. If the CHKDSK (read only mode) process is selected to run, then it will only run CHKDSK function in ‘Read Only’ mode and not the entire script. The CHKDSK process selected script will run for maximum 25 minutes. If process execution exceeds 25 minutes then it will print the partially completed details and terminate the execution asking technician to manually run CHKDSK by login to the server."
+    },
+    "MailboxDatabaseForRepair": {
+      "classNames": "col-sm-7",
+      "ui:help": "Single database, Example DB1. This function will run 'New-MailboxRepairRequest' command to detect and fix the logical corruptions. You can track the repaire request progress using Event Viewer on the server"
+    },
+    "ui:order": [ "Case", "driveLetter", "MailboxDatabaseForRepair" ]
+}

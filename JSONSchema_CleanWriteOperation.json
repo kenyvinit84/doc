@@ -1,0 +1,38 @@
+{
+    "additionalproperties": false,
+    "dependencies": {
+      "Case": {
+        "oneOf": [
+          {
+            "properties": {
+              "Case": { "enum": [ "chkdsk_Switch" ] },
+              "driveLetter": {
+                "title": "Drive Letter to perform chkdsk(if selected above option)",
+                "type": "string"
+              }
+            },
+            "required": [ "driveLetter" ]
+          },
+          {
+            "properties": {
+              "Case": { "enum": [ "MailboxRepairRequest_Switch" ] },
+              "MailboxDatabaseForRepair": {
+                "title": "Select this switch to start online mailbox repair request for all the mailboxes OR the public folder repair request against the below provided database.",
+                "type": "string"
+              }
+            },
+            "required": [ "MailboxDatabaseForRepair" ]
+          }
+        ]
+      }
+    },
+    "properties": {
+      "Case": {
+        "enum": [ "chkdsk_Switch", "MailboxRepairRequest_Switch" ],
+        "enumNames": [ "Execute CHKDSK on below mentioned drive in Read Only mode", "Start online mailbox repair request OR the public folder repair request" ],
+        "title": "Please make your selection from below list (Optional)",
+        "type": "string"
+      }
+    },
+    "type": "object"
+}
